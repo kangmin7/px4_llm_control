@@ -2,6 +2,9 @@
 
 A ROS 2 package that lets you control a PX4 multicopter in natural language. Type a mission instruction into the GUI and LLM converts it into offboard waypoints that are executed in real time over uXRCE-DDS. Requires Anthropic (Claude) api.
 
+**Demo**:
+[![Demo](https://img.youtube.com/vi/uGKmal0OO5M/maxresdefault.jpg)](https://www.youtube.com/watch?v=uGKmal0OO5M)
+
 ## Running
 
 **1. PX4 SITL:**
@@ -25,7 +28,7 @@ ros2 launch px4_llm_control px4_llm_control.launch.py
 
 ```
 take off to 5 metres
-fly forward 5 m/s for 5 seconds
+go forward 5 m/s for 5 seconds
 turn right 90 degrees then go backward 10 metres
 return to home
 ```
