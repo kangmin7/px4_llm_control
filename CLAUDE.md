@@ -70,9 +70,10 @@ message it:
    the 10 Hz offboard heartbeat, so it never runs on the main/tick thread.
 3. The worker calls `LLMPlanner.plan()` (`llm_planner.py`), which forces Claude to call a
    `submit_mission_plan` tool and returns a validated list of step dicts
-   (`action` ∈ `takeoff | goto | hold | velocity | attitude | land | rtl`, with NED
-   `x/y/z`, `altitude`, `yaw`, `duration`, `vx/vy/vz`/`yawspeed`, or `roll/pitch/thrust`
-   fields as appropriate).
+   (`action` ∈ `takeoff | goto | move | hold | velocity | attitude | land | rtl`, with NED
+   `x/y/z`, `altitude`, `yaw`, `forward/right/dz/yaw_delta`, `duration`,
+   `vx/vy/vz/forward_speed/right_speed/yawspeed`, or `roll/pitch/thrust` fields as
+   appropriate).
 4. Results are drained back on the main thread (`_drain_plans`) and appended to a
    `deque` of pending steps.
 
@@ -96,11 +97,15 @@ setpoint, then dispatches based on `State`:
   within `YAW_TOLERANCE_RAD` of it (`_at_yaw`). This makes a "turn in place" goto (same
   x/y/z, new yaw) actually wait for the rotation to finish before the next queued step
   starts, instead of completing instantly because the position is already correct.
-  `_hold_yaw` is updated to the reached yaw on completion.
+  `_hold_yaw` is updated to the reached yaw on completion. A `move` step is converted
+  into a `_goto_target` and dispatched into `GOTO` the same way (see below).
 - `HOLD` — holds position until `_timer_until` (wall clock).
 - `VELOCITY` — streams a `TrajectorySetpoint.velocity` (`_velocity_target`: vx, vy, vz,
   optional yawspeed) until `_timer_until`, then re-anchors `_hold_x/y/z`/`_hold_yaw` to
-  wherever/whichever way the vehicle ended up and returns to `IDLE`.
+  wherever/whichever way the vehicle ended up and returns to `IDLE`. A `velocity` step's
+  `forward_speed`/`right_speed` (body-frame, like `move`) are converted to NED `vx/vy`
+  in `_dispatch_next_step` using the drone's real heading at dispatch time and added to
+  any absolute `vx/vy` — the LLM never does this conversion itself.
 - `ATTITUDE` — streams a `VehicleAttitudeSetpoint` (`_attitude_target`: roll, pitch, yaw,
   thrust, converted to a quaternion + body thrust by `euler_to_quaternion()`) until
   `_timer_until`, then re-anchors `_hold_x/y/z`/`_hold_yaw` and returns to `IDLE`. This is
@@ -117,6 +122,15 @@ setpoint, then dispatches based on `State`:
 `_dispatch_next_step` (`MAX_VELOCITY_MPS`, `MAX_YAWSPEED_RADPS`, `MAX_TILT_RAD`,
 `MIN_THRUST`/`MAX_THRUST`, `MAX_TIMED_STEP_S`) regardless of what the LLM returns.
 
+`move` steps (`forward`/`right`/`dz`/`yaw_delta`, body-frame relative to the drone's
+heading) are converted to an absolute `_goto_target` in `_dispatch_next_step` using the
+drone's *actual* `_pos.x/y/z/heading` at dispatch time — not anything the LLM computed —
+so "forward"/"backward"/"left"/"right"/"turn left/right" are deterministic regardless of
+LLM arithmetic. If a step has both a `yaw_delta` and a translation (`forward`/`right`/
+`dz`), it's split: the rotation is dispatched first (pushing the translation-only
+remainder back onto the front of `_steps`), so the turn completes (via `_at_yaw`) before
+the translation — using the post-turn heading — begins.
+
 Status/progress strings are published on `/nl_mission/status` via `_status_msg()` for
 either front end to display, including a line whenever PX4's `arming_state`/`nav_state`
 changes (`_cb_status`) — useful for diagnosing arm/offboard transitions during testing.
@@ -125,9 +139,14 @@ changes (`_cb_status`) — useful for diagnosing arm/offboard transitions during
 
 All coordinates are PX4 local **NED**, matching `/fmu/out/vehicle_local_position_v1`:
 `x` = North (m), `y` = East (m), `z` = Down (m) — negative `z` is above ground
-(e.g. `z=-5` means 5 m up). Heading/yaw is radians clockwise from North. The LLM system
-prompt (`llm_planner.py`) is responsible for resolving relative phrases ("forward",
-"turn left", "climb") into these absolute NED values using the snapshot of current state.
+(e.g. `z=-5` means 5 m up). Heading/yaw is radians clockwise from North. Heading-relative
+phrases ("forward", "backward", "left", "right", "turn left/right") are emitted by the LLM
+as `move` steps (`forward`/`right`/`dz`/`yaw_delta`) and converted to absolute NED by
+`mission_executor.py` at dispatch time using the drone's real heading — the LLM never
+does this conversion itself. Only instructions phrased in absolute compass/altitude terms
+("5 m north", "climb to 10 m altitude") become `goto` steps with absolute `x/y/z`/`yaw`,
+which the LLM computes directly from the snapshot of current state (no trigonometry
+needed since north/east/down don't depend on heading).
 
 ### PX4 / uXRCE-DDS topics
 

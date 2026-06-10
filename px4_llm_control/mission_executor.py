@@ -316,13 +316,40 @@ class MissionExecutor(Node):
         elif action == 'goto':
             self._goto_target = (step['x'], step['y'], step['z'], step.get('yaw'))
             self._transition(State.GOTO)
+        elif action == 'move':
+            forward, right, dz, yaw_delta = (
+                step['forward'], step['right'], step['dz'], step['yaw_delta'])
+
+            if yaw_delta != 0.0 and (forward != 0.0 or right != 0.0 or dz != 0.0):
+                # Rotate in place first, then translate using the post-rotation
+                # heading: split into two GOTO targets — _at_yaw makes the
+                # rotation finish before the translation starts.
+                self._steps.appendleft({
+                    'action': 'move', 'forward': forward, 'right': right, 'dz': dz, 'yaw_delta': 0.0,
+                })
+                forward = right = dz = 0.0
+
+            heading = self._pos.heading + yaw_delta
+            dx = forward * math.cos(heading) - right * math.sin(heading)
+            dy = forward * math.sin(heading) + right * math.cos(heading)
+            target_yaw = heading if yaw_delta != 0.0 else None
+            self._goto_target = (self._pos.x + dx, self._pos.y + dy, self._pos.z + dz, target_yaw)
+            self._transition(State.GOTO)
         elif action == 'hold':
             self._timer_until = self._now_s() + _clamp(float(step['duration']), 0.0, MAX_TIMED_STEP_S)
             self._transition(State.HOLD)
         elif action == 'velocity':
+            vx, vy = step['vx'], step['vy']
+            forward_speed, right_speed = step['forward_speed'], step['right_speed']
+            if forward_speed != 0.0 or right_speed != 0.0:
+                # Convert body-frame speeds using the real heading at dispatch time —
+                # same formula as the 'move' action — so the LLM never does trig.
+                heading = self._pos.heading
+                vx += forward_speed * math.cos(heading) - right_speed * math.sin(heading)
+                vy += forward_speed * math.sin(heading) + right_speed * math.cos(heading)
             self._velocity_target = (
-                _clamp(step['vx'], -MAX_VELOCITY_MPS, MAX_VELOCITY_MPS),
-                _clamp(step['vy'], -MAX_VELOCITY_MPS, MAX_VELOCITY_MPS),
+                _clamp(vx, -MAX_VELOCITY_MPS, MAX_VELOCITY_MPS),
+                _clamp(vy, -MAX_VELOCITY_MPS, MAX_VELOCITY_MPS),
                 _clamp(step['vz'], -MAX_VELOCITY_MPS, MAX_VELOCITY_MPS),
                 None if step.get('yawspeed') is None
                     else _clamp(step['yawspeed'], -MAX_YAWSPEED_RADPS, MAX_YAWSPEED_RADPS),

@@ -23,38 +23,57 @@ SYSTEM_PROMPT = """You are a flight planner for a PX4 multicopter operating in N
 You are given the drone's current state and a natural-language instruction. Call
 submit_mission_plan with the ordered list of mission steps that implements it.
 
-Resolve relative phrases ("go forward 5 metres", "turn left", "climb 3 metres", "come back")
-using the drone's current position and heading, and convert them into absolute NED
-coordinates / headings. The forward direction for heading h is the unit vector
-(dx, dy) = (cos(h), sin(h)) in (x, y) — heading 0 (North) -> (+1, 0), pi/2 (East) ->
-(0, +1), pi/-pi (South) -> (-1, 0), -pi/2 (West) -> (0, -1). "Forward"/"ahead" moves
-along +(dx, dy); "backward"/"back" moves along -(dx, dy) — directly opposite of
-forward, using whatever heading is current at that point in the plan (after any
-preceding turns), never the original snapshot heading. "left" is the forward direction
-for heading h-pi/2, and "right" is for heading h+pi/2. A "goto" that doesn't mention
-altitude should keep the current z. Omit "yaw" when the instruction doesn't care about
-heading.
+Two step types cover most instructions:
 
-The instruction may describe several actions in sequence ("go forward 1 m then back 1 m",
-"turn right 90 degrees and go backward 3 metres", comma- or "then"-separated clauses,
-etc.) — emit one step per action, in order. Track a running (x, y, z, heading) starting
-from "Current state" and update it after each step you plan; use this UPDATED state, not
-the original snapshot, to resolve relative phrases for later steps in the same plan. A
-step that only changes heading ("turn left/right N degrees") with no translation should
-be a "goto" at the same x/y/z with the new "yaw" — and that new heading is what later
-"forward"/"backward"/"left"/"right" phrases in the plan are relative to.
+- "move": for anything relative to the drone's OWN heading — "go forward/backward/
+  left/right N metres", "turn left/right N degrees", "climb/descend N metres", "strafe
+  left 2 m and turn right 45 degrees", etc. Set only the fields the instruction implies;
+  any field you omit defaults to 0:
+    - "forward": metres along the current heading (negative = backward)
+    - "right": metres to the right of the current heading (negative = left)
+    - "dz": change in NED z, metres (negative = climb, positive = descend)
+    - "yaw_delta": change in heading, radians (positive = turn right/clockwise,
+      negative = turn left/counter-clockwise)
+  The executor applies these using the drone's REAL heading and position at the moment
+  the step actually runs, and if a step has both a "yaw_delta" and a "forward"/"right"/
+  "dz", it rotates first and then translates using the new heading. So do NOT do any
+  trigonometry, running-state tracking, or position math for "move" steps — just read
+  the numbers straight off the instruction.
 
-Example: from x=0, y=0, z=-5, heading=0 (North), "turn right 90 degrees and go backward
-3 metres" becomes two steps: (1) goto x=0, y=0, z=-5, yaw=pi/2 (now facing East); (2)
-"backward" relative to facing East is West, i.e. -y, so goto x=0, y=-3, z=-5, yaw=pi/2.
+- "goto": for an ABSOLUTE target given in compass/altitude terms, independent of the
+  drone's heading — "go 5 metres north and 3 metres east", "climb to 10 metres
+  altitude", "fly to x=2, y=-1". Give absolute "x"/"y"/"z" (and optional "yaw"); a
+  "goto" that doesn't mention altitude should keep the current z. Compute these with
+  simple addition/subtraction from "Current state" — no trigonometry needed since
+  north/east/down are fixed axes regardless of heading. Omit "yaw" when the instruction
+  doesn't care about heading.
+
+The instruction may describe several actions in sequence ("go forward 1 m then turn left
+90 degrees", "turn right 90 degrees and go backward 3 metres", comma- or "then"-separated
+clauses, etc.) — emit one step per action, in order. Consecutive "move" steps need no
+shared state: each one's forward/right/dz/yaw_delta is resolved against whatever the
+heading/position is when IT runs. Only track a running (x, y, z, heading) if a later step
+is an absolute "goto" whose target depends on where earlier steps leave the drone.
+
+Example: "turn right 90 degrees then go backward 10 metres" becomes two "move" steps:
+(1) {"action": "move", "yaw_delta": 1.5708}; (2) {"action": "move", "forward": -10}.
+Neither step needs x/y/z/yaw — the executor works out the actual NED motion from the
+drone's heading at the time each step runs.
 
 Two additional step types give finer control:
 
-- "velocity": command a velocity (vx, vy, vz in NED m/s) and optional yawspeed (rad/s,
-  same clockwise-from-North sign convention as heading) for "duration" seconds. Use this
-  whenever the instruction gives an explicit speed, e.g. "fly forward at 2 m/s for 5
-  seconds" — resolve "forward"/"left"/"right" into vx/vy using the current heading, same
-  as for goto.
+- "velocity": command a velocity for "duration" seconds, with an optional yawspeed
+  (rad/s, same clockwise-from-North sign convention as heading). Use this whenever the
+  instruction gives an explicit speed, e.g. "fly forward at 2 m/s for 5 seconds". Just
+  like "move", give heading-relative speeds directly — do NOT do any trigonometry; the
+  executor converts these to NED using the drone's real heading at the moment the step
+  runs:
+    - "forward_speed": m/s along the current heading (negative = backward)
+    - "right_speed": m/s to the right of the current heading (negative = left)
+    - "vz": NED down speed, m/s (negative = climbing)
+  For an ABSOLUTE compass-direction speed instead ("fly north at 2 m/s"), use "vx"/"vy"
+  (NED north/east m/s, independent of heading) — these add on top of any
+  forward_speed/right_speed.
 - "attitude": command a body tilt (roll, pitch in radians, FRD frame), an absolute target
   "yaw" (radians, same convention as heading), and a normalized "thrust" (0..1, where
   ~0.5 roughly hovers the default SITL vehicle) for "duration" seconds. This is a raw,
@@ -78,7 +97,7 @@ PLAN_TOOL = {
                     'properties': {
                         'action': {
                             'type': 'string',
-                            'enum': ['takeoff', 'goto', 'hold', 'velocity', 'attitude', 'land', 'rtl'],
+                            'enum': ['takeoff', 'goto', 'move', 'hold', 'velocity', 'attitude', 'land', 'rtl'],
                         },
                         'altitude': {
                             'type': 'number',
@@ -97,8 +116,41 @@ PLAN_TOOL = {
                                 'attitude: required target heading in radians.'
                             ),
                         },
-                        'vx': {'type': 'number', 'description': 'velocity: NED north speed, m/s'},
-                        'vy': {'type': 'number', 'description': 'velocity: NED east speed, m/s'},
+                        'forward': {
+                            'type': 'number',
+                            'description': 'move: metres along the current heading (negative = backward)',
+                        },
+                        'right': {
+                            'type': 'number',
+                            'description': 'move: metres to the right of the current heading (negative = left)',
+                        },
+                        'dz': {
+                            'type': 'number',
+                            'description': 'move: change in NED z, metres (negative = climb, positive = descend)',
+                        },
+                        'yaw_delta': {
+                            'type': 'number',
+                            'description': (
+                                'move: change in heading, radians '
+                                '(positive = turn right/clockwise, negative = turn left/counter-clockwise)'
+                            ),
+                        },
+                        'forward_speed': {
+                            'type': 'number',
+                            'description': 'velocity: m/s along the current heading (negative = backward)',
+                        },
+                        'right_speed': {
+                            'type': 'number',
+                            'description': 'velocity: m/s to the right of the current heading (negative = left)',
+                        },
+                        'vx': {
+                            'type': 'number',
+                            'description': 'velocity: absolute NED north speed, m/s (independent of heading)',
+                        },
+                        'vy': {
+                            'type': 'number',
+                            'description': 'velocity: absolute NED east speed, m/s (independent of heading)',
+                        },
                         'vz': {
                             'type': 'number',
                             'description': 'velocity: NED down speed, m/s (negative = climbing)',
@@ -126,16 +178,19 @@ PLAN_TOOL = {
     },
 }
 
-VALID_ACTIONS = {'takeoff', 'goto', 'hold', 'velocity', 'attitude', 'land', 'rtl'}
+VALID_ACTIONS = {'takeoff', 'goto', 'move', 'hold', 'velocity', 'attitude', 'land', 'rtl'}
 REQUIRED_FIELDS = {
     'takeoff': ('altitude',),
     'goto': ('x', 'y', 'z'),
+    'move': (),
     'hold': ('duration',),
-    'velocity': ('vx', 'vy', 'vz', 'duration'),
+    'velocity': ('duration',),
     'attitude': ('roll', 'pitch', 'yaw', 'thrust', 'duration'),
     'land': (),
     'rtl': (),
 }
+MOVE_FIELDS = ('forward', 'right', 'dz', 'yaw_delta')
+VELOCITY_FIELDS = ('vx', 'vy', 'vz', 'forward_speed', 'right_speed')
 
 
 class PlannerError(RuntimeError):
@@ -189,5 +244,14 @@ class LLMPlanner:
             if missing:
                 raise PlannerError(f'Step {i} ({action}) is missing {missing}: {steps}')
             step.setdefault('yaw', None)
+            if action == 'move':
+                for f in MOVE_FIELDS:
+                    step.setdefault(f, 0.0)
+                if not any(step[f] for f in MOVE_FIELDS):
+                    raise PlannerError(f'Step {i} (move) has no forward/right/dz/yaw_delta: {steps}')
+            elif action == 'velocity':
+                for f in VELOCITY_FIELDS:
+                    step.setdefault(f, 0.0)
+                step.setdefault('yawspeed', None)
 
         return steps
