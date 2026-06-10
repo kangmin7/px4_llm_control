@@ -25,9 +25,7 @@ ros2 launch px4_llm_control px4_llm_control.launch.py
 
 ```
 take off to 5 metres
-fly forward 2 m/s for 5 seconds
-turn right 90 degrees and go backward 3 metres
-tilt forward gently and climb for 2 seconds
+fly forward 5 m/s for 5 seconds
+turn right 90 degrees then go backward 10 metres
 return to home
-land
 ```

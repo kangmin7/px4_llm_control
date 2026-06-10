@@ -89,23 +89,29 @@ setpoint, then dispatches based on `State`:
   sibling `interceptor_mission` package), then transitions to `IDLE` to dispatch that
   step. Arming/offboard is never automatic — it only happens in response to a queued
   instruction.
-- `IDLE` — holds the last commanded position (`_hold_x/y/z`); pops and dispatches the
-  next step from `_steps` if any are queued.
+- `IDLE` — holds the last commanded position and heading (`_hold_x/y/z`, `_hold_yaw`);
+  pops and dispatches the next step from `_steps` if any are queued.
 - `TAKEOFF` / `GOTO` — fly to `_goto_target` (x, y, z, yaw) via position setpoints;
-  transition back to `IDLE` once within `POS_TOLERANCE_M`.
+  transition back to `IDLE` once within `POS_TOLERANCE_M` **and**, if a `yaw` was given,
+  within `YAW_TOLERANCE_RAD` of it (`_at_yaw`). This makes a "turn in place" goto (same
+  x/y/z, new yaw) actually wait for the rotation to finish before the next queued step
+  starts, instead of completing instantly because the position is already correct.
+  `_hold_yaw` is updated to the reached yaw on completion.
 - `HOLD` — holds position until `_timer_until` (wall clock).
 - `VELOCITY` — streams a `TrajectorySetpoint.velocity` (`_velocity_target`: vx, vy, vz,
-  optional yawspeed) until `_timer_until`, then re-anchors `_hold_x/y/z` to wherever the
-  vehicle ended up and returns to `IDLE`.
+  optional yawspeed) until `_timer_until`, then re-anchors `_hold_x/y/z`/`_hold_yaw` to
+  wherever/whichever way the vehicle ended up and returns to `IDLE`.
 - `ATTITUDE` — streams a `VehicleAttitudeSetpoint` (`_attitude_target`: roll, pitch, yaw,
   thrust, converted to a quaternion + body thrust by `euler_to_quaternion()`) until
-  `_timer_until`, then re-anchors `_hold_x/y/z` and returns to `IDLE`. This is an
-  open-loop maneuver — no position/altitude hold while active.
+  `_timer_until`, then re-anchors `_hold_x/y/z`/`_hold_yaw` and returns to `IDLE`. This is
+  an open-loop maneuver — no position/altitude hold while active.
 - `LAND` / `RTL` — one-shot handoff to PX4's `AUTO_LAND` / `AUTO_RTL`, then move to
   `EXTERNAL_WAIT`.
 - `EXTERNAL_WAIT` — waits for PX4 to disarm after a LAND/RTL, clears any remaining
   queued steps, then returns to `GROUNDED` (disarmed, not in OFFBOARD) until the next
-  instruction is queued.
+  instruction is queued. If PX4 hasn't reported `ARMING_STATE_DISARMED` within
+  `EXTERNAL_WAIT_TIMEOUT_S`, gives up waiting and returns to `GROUNDED` anyway, so a
+  stalled auto-disarm can't permanently strand later instructions in `_steps`.
 
 `velocity`/`attitude`/`hold` step values from the planner are clamped to safe ranges in
 `_dispatch_next_step` (`MAX_VELOCITY_MPS`, `MAX_YAWSPEED_RADPS`, `MAX_TILT_RAD`,

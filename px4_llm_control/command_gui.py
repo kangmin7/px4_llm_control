@@ -24,6 +24,8 @@ class CommandGUI(Node):
         self._root = root
         self._pub = self.create_publisher(String, '/nl_command', 10)
         self.create_subscription(String, '/nl_mission/status', self._on_status, 10)
+        self._history = []
+        self._history_index = None
         self._build_ui()
 
     # ── ROS callbacks ─────────────────────────────────────────────────────────
@@ -75,6 +77,8 @@ class CommandGUI(Node):
         )
         self._entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6)
         self._entry.bind('<Return>', self._send)
+        self._entry.bind('<Up>', self._history_prev)
+        self._entry.bind('<Down>', self._history_next)
         self._entry.focus()
 
         tk.Button(
@@ -101,6 +105,33 @@ class CommandGUI(Node):
         self._append_log(f'> {text}', tag='sent')
         self._pub.publish(String(data=text))
         self._flash_dot()
+        self._history.append(text)
+        self._history_index = None
+
+    def _history_prev(self, _event=None):
+        if not self._history:
+            return 'break'
+        if self._history_index is None:
+            self._history_index = len(self._history) - 1
+        elif self._history_index > 0:
+            self._history_index -= 1
+        self._set_entry_text(self._history[self._history_index])
+        return 'break'
+
+    def _history_next(self, _event=None):
+        if self._history_index is None:
+            return 'break'
+        if self._history_index < len(self._history) - 1:
+            self._history_index += 1
+            self._set_entry_text(self._history[self._history_index])
+        else:
+            self._history_index = None
+            self._set_entry_text('')
+        return 'break'
+
+    def _set_entry_text(self, text: str):
+        self._entry.delete(0, tk.END)
+        self._entry.insert(0, text)
 
     def _append_log(self, message: str, tag: str = 'status'):
         ts = datetime.now().strftime('%H:%M:%S')

@@ -25,9 +25,28 @@ submit_mission_plan with the ordered list of mission steps that implements it.
 
 Resolve relative phrases ("go forward 5 metres", "turn left", "climb 3 metres", "come back")
 using the drone's current position and heading, and convert them into absolute NED
-coordinates / headings. "Forward"/"ahead" is along the current heading; "left" is -90
-degrees from it and "right" is +90 degrees. A "goto" that doesn't mention altitude should
-keep the current z. Omit "yaw" when the instruction doesn't care about heading.
+coordinates / headings. The forward direction for heading h is the unit vector
+(dx, dy) = (cos(h), sin(h)) in (x, y) — heading 0 (North) -> (+1, 0), pi/2 (East) ->
+(0, +1), pi/-pi (South) -> (-1, 0), -pi/2 (West) -> (0, -1). "Forward"/"ahead" moves
+along +(dx, dy); "backward"/"back" moves along -(dx, dy) — directly opposite of
+forward, using whatever heading is current at that point in the plan (after any
+preceding turns), never the original snapshot heading. "left" is the forward direction
+for heading h-pi/2, and "right" is for heading h+pi/2. A "goto" that doesn't mention
+altitude should keep the current z. Omit "yaw" when the instruction doesn't care about
+heading.
+
+The instruction may describe several actions in sequence ("go forward 1 m then back 1 m",
+"turn right 90 degrees and go backward 3 metres", comma- or "then"-separated clauses,
+etc.) — emit one step per action, in order. Track a running (x, y, z, heading) starting
+from "Current state" and update it after each step you plan; use this UPDATED state, not
+the original snapshot, to resolve relative phrases for later steps in the same plan. A
+step that only changes heading ("turn left/right N degrees") with no translation should
+be a "goto" at the same x/y/z with the new "yaw" — and that new heading is what later
+"forward"/"backward"/"left"/"right" phrases in the plan are relative to.
+
+Example: from x=0, y=0, z=-5, heading=0 (North), "turn right 90 degrees and go backward
+3 metres" becomes two steps: (1) goto x=0, y=0, z=-5, yaw=pi/2 (now facing East); (2)
+"backward" relative to facing East is West, i.e. -y, so goto x=0, y=-3, z=-5, yaw=pi/2.
 
 Two additional step types give finer control:
 

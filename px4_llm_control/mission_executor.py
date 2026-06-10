@@ -38,6 +38,7 @@ from px4_msgs.msg import (
 from px4_llm_control.llm_planner import LLMPlanner, PlannerError
 
 POS_TOLERANCE_M = 0.5    # metres — close enough to declare a goto/takeoff complete
+YAW_TOLERANCE_RAD = 0.05 # ~3 degrees — close enough to declare a goto/takeoff heading reached
 HEARTBEAT_TICKS = 15     # 1.5 s of setpoints before arm + offboard (matches interceptor_mission)
 TICK_HZ         = 10.0
 
@@ -48,6 +49,7 @@ MAX_TILT_RAD       = 0.35   # ~20 degrees — roll/pitch clamp for 'attitude' st
 MIN_THRUST         = 0.0
 MAX_THRUST         = 0.9    # leave headroom below full throttle
 MAX_TIMED_STEP_S   = 15.0   # duration clamp for 'hold' / 'velocity' / 'attitude' steps
+EXTERNAL_WAIT_TIMEOUT_S = 10.0  # give up waiting for PX4 to auto-disarm after LAND/RTL
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -122,12 +124,13 @@ class MissionExecutor(Node):
         self._hold_x = 0.0
         self._hold_y = 0.0
         self._hold_z = 0.0
+        self._hold_yaw = None
 
         self._steps       = deque()                 # pending mission steps (dicts)
         self._goto_target = (0.0, 0.0, 0.0, None)   # (x, y, z, yaw) for TAKEOFF / GOTO
         self._velocity_target = (0.0, 0.0, 0.0, None)  # (vx, vy, vz, yawspeed) for VELOCITY
         self._attitude_target = (0.0, 0.0, 0.0, 0.0)   # (roll, pitch, yaw, thrust) for ATTITUDE
-        self._timer_until = 0.0                      # clock seconds for HOLD / VELOCITY / ATTITUDE
+        self._timer_until = 0.0                      # clock seconds for HOLD / VELOCITY / ATTITUDE / EXTERNAL_WAIT
 
         # The LLM call blocks on the network — run it on a worker thread so the
         # 10 Hz offboard heartbeat (required to stay in OFFBOARD mode) never stalls.
@@ -258,6 +261,12 @@ class MissionExecutor(Node):
     def _at_position(self, x: float, y: float, z: float, tol: float = POS_TOLERANCE_M) -> bool:
         return math.dist((self._pos.x, self._pos.y, self._pos.z), (x, y, z)) < tol
 
+    def _at_yaw(self, yaw, tol: float = YAW_TOLERANCE_RAD) -> bool:
+        if yaw is None:
+            return True
+        error = (yaw - self._pos.heading + math.pi) % (2 * math.pi) - math.pi
+        return abs(error) < tol
+
     def _transition(self, new_state: State):
         self.get_logger().info(f'{self._state.name} → {new_state.name}')
         self._state = new_state
@@ -292,7 +301,7 @@ class MissionExecutor(Node):
             self._transition(State.IDLE)
 
     def _s_idle(self):
-        self._send_setpoint(self._hold_x, self._hold_y, self._hold_z)
+        self._send_setpoint(self._hold_x, self._hold_y, self._hold_z, yaw=self._hold_yaw)
         if self._steps:
             self._dispatch_next_step()
 
@@ -337,16 +346,19 @@ class MissionExecutor(Node):
     def _s_takeoff(self):
         x, y, z, yaw = self._goto_target
         self._send_setpoint(x, y, z, yaw=yaw)
-        if self._at_position(x, y, z, tol=0.3):
+        if self._at_position(x, y, z, tol=0.3) and self._at_yaw(yaw):
             self._hold_x, self._hold_y, self._hold_z = x, y, z
+            self._hold_yaw = yaw
             self._status_msg('takeoff complete')
             self._transition(State.IDLE)
 
     def _s_goto(self):
         x, y, z, yaw = self._goto_target
         self._send_setpoint(x, y, z, yaw=yaw)
-        if self._at_position(x, y, z):
+        if self._at_position(x, y, z) and self._at_yaw(yaw):
             self._hold_x, self._hold_y, self._hold_z = x, y, z
+            if yaw is not None:
+                self._hold_yaw = yaw
             self._status_msg(f'reached ({x:.1f}, {y:.1f}, {z:.1f})')
             self._transition(State.IDLE)
 
@@ -360,6 +372,7 @@ class MissionExecutor(Node):
         self._send_velocity_setpoint(vx, vy, vz, yawspeed)
         if self._now_s() >= self._timer_until:
             self._hold_x, self._hold_y, self._hold_z = self._pos.x, self._pos.y, self._pos.z
+            self._hold_yaw = self._pos.heading
             self._status_msg(
                 f'velocity segment complete at ({self._hold_x:.1f}, {self._hold_y:.1f}, {self._hold_z:.1f})')
             self._transition(State.IDLE)
@@ -369,26 +382,35 @@ class MissionExecutor(Node):
         self._send_attitude_setpoint(roll, pitch, yaw, thrust)
         if self._now_s() >= self._timer_until:
             self._hold_x, self._hold_y, self._hold_z = self._pos.x, self._pos.y, self._pos.z
+            self._hold_yaw = self._pos.heading
             self._status_msg('attitude segment complete')
             self._transition(State.IDLE)
 
     def _s_land(self):
         self._send_cmd(VehicleCommand.VEHICLE_CMD_NAV_LAND)
         self._status_msg('landing')
+        self._timer_until = self._now_s() + EXTERNAL_WAIT_TIMEOUT_S
         self._transition(State.EXTERNAL_WAIT)
 
     def _s_rtl(self):
         self._send_cmd(VehicleCommand.VEHICLE_CMD_NAV_RETURN_TO_LAUNCH)
         self._status_msg('returning to launch')
+        self._timer_until = self._now_s() + EXTERNAL_WAIT_TIMEOUT_S
         self._transition(State.EXTERNAL_WAIT)
 
     def _s_external_wait(self):
         # PX4 is flying its own LAND/RTL sequence on its own — wait for it to
         # disarm, then go back to GROUNDED so the next instruction re-arms and
-        # re-engages offboard on demand.
+        # re-engages offboard on demand. If PX4 doesn't report disarmed within
+        # EXTERNAL_WAIT_TIMEOUT_S (e.g. auto-disarm-after-land didn't fire), give up
+        # waiting anyway so new instructions aren't stuck in _steps forever.
         if self._status.arming_state == VehicleStatus.ARMING_STATE_DISARMED:
             self._steps.clear()
             self._status_msg('landed and disarmed — send another instruction when ready')
+            self._hb_count = 0
+            self._transition(State.GROUNDED)
+        elif self._now_s() >= self._timer_until:
+            self._status_msg('did not see disarm after land/RTL — resuming control anyway')
             self._hb_count = 0
             self._transition(State.GROUNDED)
 
