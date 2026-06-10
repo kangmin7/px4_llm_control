@@ -5,9 +5,10 @@ Natural-language mission executor for PX4 multicopters.
 Subscribes to `/nl_command` (std_msgs/String). Each message is one plain-English
 instruction, e.g. "take off to 5 metres, fly 10 metres north, then hold for 3
 seconds and land". An LLMPlanner (llm_planner.py) converts it into an ordered
-list of mission steps — takeoff / goto / hold / land / rtl — which this node
-executes one at a time over PX4 offboard control: the same OffboardControlMode +
-TrajectorySetpoint + VehicleCommand pattern used by interceptor_mission.
+list of mission steps — takeoff / goto / hold / velocity / attitude / land / rtl —
+which this node executes one at a time over PX4 offboard control: the same
+OffboardControlMode + TrajectorySetpoint + VehicleCommand pattern used by
+interceptor_mission, plus VehicleAttitudeSetpoint for attitude steps.
 
 Coordinate frame: NED, matching /fmu/out/vehicle_local_position_v1
 (x = North, y = East, z = Down in metres; z < 0 is above the ground).
@@ -30,7 +31,7 @@ from rclpy.qos import (
 
 from std_msgs.msg import String
 from px4_msgs.msg import (
-    OffboardControlMode, TrajectorySetpoint, VehicleCommand,
+    OffboardControlMode, TrajectorySetpoint, VehicleAttitudeSetpoint, VehicleCommand,
     VehicleLocalPosition, VehicleStatus,
 )
 
@@ -40,13 +41,41 @@ POS_TOLERANCE_M = 0.5    # metres — close enough to declare a goto/takeoff com
 HEARTBEAT_TICKS = 15     # 1.5 s of setpoints before arm + offboard (matches interceptor_mission)
 TICK_HZ         = 10.0
 
+# Safety clamps applied to velocity/attitude steps regardless of what the planner returns.
+MAX_VELOCITY_MPS   = 5.0    # vx/vy/vz clamp for 'velocity' steps
+MAX_YAWSPEED_RADPS = 1.0    # yawspeed clamp for 'velocity' steps
+MAX_TILT_RAD       = 0.35   # ~20 degrees — roll/pitch clamp for 'attitude' steps
+MIN_THRUST         = 0.0
+MAX_THRUST         = 0.9    # leave headroom below full throttle
+MAX_TIMED_STEP_S   = 15.0   # duration clamp for 'hold' / 'velocity' / 'attitude' steps
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def euler_to_quaternion(roll: float, pitch: float, yaw: float):
+    """ZYX Euler angles (radians) -> quaternion [w, x, y, z]."""
+    cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
+    cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
+    cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
+    return [
+        cr * cp * cy + sr * sp * sy,
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+    ]
+
 
 class State(Enum):
-    INIT          = auto()   # pre-arm heartbeat, then arm + engage offboard
+    GROUNDED      = auto()   # disarmed on the ground, streaming heartbeat setpoints —
+                              # arms + engages offboard once a step is queued
     IDLE          = auto()   # holding position, waiting for the next mission step
     TAKEOFF       = auto()   # climbing to a commanded altitude
     GOTO          = auto()   # flying to an (x, y, z, yaw) setpoint
     HOLD          = auto()   # holding position for a fixed duration
+    VELOCITY      = auto()   # commanding an NED velocity (+ optional yaw rate) for a fixed duration
+    ATTITUDE      = auto()   # commanding a roll/pitch/yaw + thrust setpoint for a fixed duration
     LAND          = auto()   # one-shot: hand off to PX4's AUTO_LAND
     RTL           = auto()   # one-shot: hand off to PX4's AUTO_RTL
     EXTERNAL_WAIT = auto()   # PX4-driven land/RTL in progress — wait for disarm
@@ -70,6 +99,8 @@ class MissionExecutor(Node):
             TrajectorySetpoint, '/fmu/in/trajectory_setpoint', px4_qos)
         self._pub_cmd = self.create_publisher(
             VehicleCommand, '/fmu/in/vehicle_command', px4_qos)
+        self._pub_att = self.create_publisher(
+            VehicleAttitudeSetpoint, '/fmu/in/vehicle_attitude_setpoint', px4_qos)
         self._pub_status = self.create_publisher(String, '/nl_mission/status', 10)
 
         self.create_subscription(
@@ -80,8 +111,10 @@ class MissionExecutor(Node):
 
         self._pos    = VehicleLocalPosition()
         self._status = VehicleStatus()
+        self._last_arming_state = None
+        self._last_nav_state    = None
 
-        self._state    = State.INIT
+        self._state    = State.GROUNDED
         self._hb_count = 0
 
         # Fixed setpoint the drone holds while idle / mid-hold (avoids feeding back
@@ -92,7 +125,9 @@ class MissionExecutor(Node):
 
         self._steps       = deque()                 # pending mission steps (dicts)
         self._goto_target = (0.0, 0.0, 0.0, None)   # (x, y, z, yaw) for TAKEOFF / GOTO
-        self._hold_until  = 0.0                      # clock seconds for HOLD
+        self._velocity_target = (0.0, 0.0, 0.0, None)  # (vx, vy, vz, yawspeed) for VELOCITY
+        self._attitude_target = (0.0, 0.0, 0.0, 0.0)   # (roll, pitch, yaw, thrust) for ATTITUDE
+        self._timer_until = 0.0                      # clock seconds for HOLD / VELOCITY / ATTITUDE
 
         # The LLM call blocks on the network — run it on a worker thread so the
         # 10 Hz offboard heartbeat (required to stay in OFFBOARD mode) never stalls.
@@ -111,6 +146,10 @@ class MissionExecutor(Node):
 
     def _cb_status(self, msg: VehicleStatus):
         self._status = msg
+        if msg.arming_state != self._last_arming_state or msg.nav_state != self._last_nav_state:
+            self._status_msg(f'PX4: arming_state={msg.arming_state}, nav_state={msg.nav_state}')
+            self._last_arming_state = msg.arming_state
+            self._last_nav_state    = msg.nav_state
 
     def _cb_command(self, msg: String):
         instruction = msg.data.strip()
@@ -161,7 +200,9 @@ class MissionExecutor(Node):
 
     def _send_ocm(self):
         msg = OffboardControlMode()
-        msg.position  = True
+        msg.position  = self._state not in (State.VELOCITY, State.ATTITUDE)
+        msg.velocity  = self._state == State.VELOCITY
+        msg.attitude  = self._state == State.ATTITUDE
         msg.timestamp = self._ts()
         self._pub_ocm.publish(msg)
 
@@ -171,6 +212,23 @@ class MissionExecutor(Node):
         msg.yaw       = float('nan') if yaw is None else float(yaw)
         msg.timestamp = self._ts()
         self._pub_tsp.publish(msg)
+
+    def _send_velocity_setpoint(self, vx: float, vy: float, vz: float, yawspeed=None):
+        msg = TrajectorySetpoint()
+        nan = float('nan')
+        msg.position  = [nan, nan, nan]
+        msg.velocity  = [float(vx), float(vy), float(vz)]
+        msg.yaw       = nan
+        msg.yawspeed  = nan if yawspeed is None else float(yawspeed)
+        msg.timestamp = self._ts()
+        self._pub_tsp.publish(msg)
+
+    def _send_attitude_setpoint(self, roll: float, pitch: float, yaw: float, thrust: float):
+        msg = VehicleAttitudeSetpoint()
+        msg.q_d        = euler_to_quaternion(roll, pitch, yaw)
+        msg.thrust_body = [0.0, 0.0, -float(thrust)]
+        msg.timestamp  = self._ts()
+        self._pub_att.publish(msg)
 
     def _send_cmd(self, command: int, **kw):
         msg = VehicleCommand()
@@ -210,20 +268,25 @@ class MissionExecutor(Node):
         self._drain_plans()
         self._send_ocm()
 
-        if   self._state == State.INIT:          self._s_init()
+        if   self._state == State.GROUNDED:      self._s_grounded()
         elif self._state == State.IDLE:          self._s_idle()
         elif self._state == State.TAKEOFF:       self._s_takeoff()
         elif self._state == State.GOTO:          self._s_goto()
         elif self._state == State.HOLD:          self._s_hold()
+        elif self._state == State.VELOCITY:      self._s_velocity()
+        elif self._state == State.ATTITUDE:      self._s_attitude()
         elif self._state == State.LAND:          self._s_land()
         elif self._state == State.RTL:           self._s_rtl()
         elif self._state == State.EXTERNAL_WAIT: self._s_external_wait()
 
-    def _s_init(self):
+    def _s_grounded(self):
         self._send_setpoint(self._pos.x, self._pos.y, self._pos.z, yaw=self._pos.heading)
-        self._hb_count += 1
-        if self._hb_count >= HEARTBEAT_TICKS:
+        if self._hb_count < HEARTBEAT_TICKS:
+            self._hb_count += 1
+            return
+        if self._steps:
             self._hold_x, self._hold_y, self._hold_z = self._pos.x, self._pos.y, self._pos.z
+            self._status_msg('arming and engaging offboard')
             self._engage_offboard()
             self._arm()
             self._transition(State.IDLE)
@@ -245,8 +308,27 @@ class MissionExecutor(Node):
             self._goto_target = (step['x'], step['y'], step['z'], step.get('yaw'))
             self._transition(State.GOTO)
         elif action == 'hold':
-            self._hold_until = self._now_s() + float(step['duration'])
+            self._timer_until = self._now_s() + _clamp(float(step['duration']), 0.0, MAX_TIMED_STEP_S)
             self._transition(State.HOLD)
+        elif action == 'velocity':
+            self._velocity_target = (
+                _clamp(step['vx'], -MAX_VELOCITY_MPS, MAX_VELOCITY_MPS),
+                _clamp(step['vy'], -MAX_VELOCITY_MPS, MAX_VELOCITY_MPS),
+                _clamp(step['vz'], -MAX_VELOCITY_MPS, MAX_VELOCITY_MPS),
+                None if step.get('yawspeed') is None
+                    else _clamp(step['yawspeed'], -MAX_YAWSPEED_RADPS, MAX_YAWSPEED_RADPS),
+            )
+            self._timer_until = self._now_s() + _clamp(float(step['duration']), 0.0, MAX_TIMED_STEP_S)
+            self._transition(State.VELOCITY)
+        elif action == 'attitude':
+            self._attitude_target = (
+                _clamp(step['roll'], -MAX_TILT_RAD, MAX_TILT_RAD),
+                _clamp(step['pitch'], -MAX_TILT_RAD, MAX_TILT_RAD),
+                step['yaw'],
+                _clamp(step['thrust'], MIN_THRUST, MAX_THRUST),
+            )
+            self._timer_until = self._now_s() + _clamp(float(step['duration']), 0.0, MAX_TIMED_STEP_S)
+            self._transition(State.ATTITUDE)
         elif action == 'land':
             self._transition(State.LAND)
         elif action == 'rtl':
@@ -270,7 +352,24 @@ class MissionExecutor(Node):
 
     def _s_hold(self):
         self._send_setpoint(self._hold_x, self._hold_y, self._hold_z)
-        if self._now_s() >= self._hold_until:
+        if self._now_s() >= self._timer_until:
+            self._transition(State.IDLE)
+
+    def _s_velocity(self):
+        vx, vy, vz, yawspeed = self._velocity_target
+        self._send_velocity_setpoint(vx, vy, vz, yawspeed)
+        if self._now_s() >= self._timer_until:
+            self._hold_x, self._hold_y, self._hold_z = self._pos.x, self._pos.y, self._pos.z
+            self._status_msg(
+                f'velocity segment complete at ({self._hold_x:.1f}, {self._hold_y:.1f}, {self._hold_z:.1f})')
+            self._transition(State.IDLE)
+
+    def _s_attitude(self):
+        roll, pitch, yaw, thrust = self._attitude_target
+        self._send_attitude_setpoint(roll, pitch, yaw, thrust)
+        if self._now_s() >= self._timer_until:
+            self._hold_x, self._hold_y, self._hold_z = self._pos.x, self._pos.y, self._pos.z
+            self._status_msg('attitude segment complete')
             self._transition(State.IDLE)
 
     def _s_land(self):
@@ -285,13 +384,13 @@ class MissionExecutor(Node):
 
     def _s_external_wait(self):
         # PX4 is flying its own LAND/RTL sequence on its own — wait for it to
-        # disarm, then re-arm and re-engage offboard so the next instruction
-        # (if any was queued) can run.
+        # disarm, then go back to GROUNDED so the next instruction re-arms and
+        # re-engages offboard on demand.
         if self._status.arming_state == VehicleStatus.ARMING_STATE_DISARMED:
             self._steps.clear()
-            self._status_msg('landed and disarmed — ready for the next instruction')
+            self._status_msg('landed and disarmed — send another instruction when ready')
             self._hb_count = 0
-            self._transition(State.INIT)
+            self._transition(State.GROUNDED)
 
 
 def main(args=None):

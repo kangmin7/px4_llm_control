@@ -28,6 +28,21 @@ using the drone's current position and heading, and convert them into absolute N
 coordinates / headings. "Forward"/"ahead" is along the current heading; "left" is -90
 degrees from it and "right" is +90 degrees. A "goto" that doesn't mention altitude should
 keep the current z. Omit "yaw" when the instruction doesn't care about heading.
+
+Two additional step types give finer control:
+
+- "velocity": command a velocity (vx, vy, vz in NED m/s) and optional yawspeed (rad/s,
+  same clockwise-from-North sign convention as heading) for "duration" seconds. Use this
+  whenever the instruction gives an explicit speed, e.g. "fly forward at 2 m/s for 5
+  seconds" — resolve "forward"/"left"/"right" into vx/vy using the current heading, same
+  as for goto.
+- "attitude": command a body tilt (roll, pitch in radians, FRD frame), an absolute target
+  "yaw" (radians, same convention as heading), and a normalized "thrust" (0..1, where
+  ~0.5 roughly hovers the default SITL vehicle) for "duration" seconds. This is a raw,
+  open-loop maneuver with no position or altitude hold — only use it when the instruction
+  explicitly asks for a tilt/bank/roll/pitch/thrust maneuver, keep roll/pitch small
+  (well under 0.35 rad) and "duration" short (a few seconds) unless told otherwise, since
+  the vehicle will drift in position and altitude for the whole duration.
 """
 
 PLAN_TOOL = {
@@ -44,7 +59,7 @@ PLAN_TOOL = {
                     'properties': {
                         'action': {
                             'type': 'string',
-                            'enum': ['takeoff', 'goto', 'hold', 'land', 'rtl'],
+                            'enum': ['takeoff', 'goto', 'hold', 'velocity', 'attitude', 'land', 'rtl'],
                         },
                         'altitude': {
                             'type': 'number',
@@ -58,9 +73,31 @@ PLAN_TOOL = {
                         },
                         'yaw': {
                             'type': 'number',
-                            'description': 'goto: optional heading in radians',
+                            'description': (
+                                'goto: optional target heading in radians. '
+                                'attitude: required target heading in radians.'
+                            ),
                         },
-                        'duration': {'type': 'number', 'description': 'hold: seconds'},
+                        'vx': {'type': 'number', 'description': 'velocity: NED north speed, m/s'},
+                        'vy': {'type': 'number', 'description': 'velocity: NED east speed, m/s'},
+                        'vz': {
+                            'type': 'number',
+                            'description': 'velocity: NED down speed, m/s (negative = climbing)',
+                        },
+                        'yawspeed': {
+                            'type': 'number',
+                            'description': 'velocity: optional yaw rate, rad/s (clockwise from North)',
+                        },
+                        'roll': {'type': 'number', 'description': 'attitude: body roll, radians (FRD)'},
+                        'pitch': {'type': 'number', 'description': 'attitude: body pitch, radians (FRD)'},
+                        'thrust': {
+                            'type': 'number',
+                            'description': 'attitude: normalized thrust, 0..1 (~0.5 roughly hovers)',
+                        },
+                        'duration': {
+                            'type': 'number',
+                            'description': 'hold / velocity / attitude: seconds',
+                        },
                     },
                     'required': ['action'],
                 },
@@ -70,11 +107,13 @@ PLAN_TOOL = {
     },
 }
 
-VALID_ACTIONS = {'takeoff', 'goto', 'hold', 'land', 'rtl'}
+VALID_ACTIONS = {'takeoff', 'goto', 'hold', 'velocity', 'attitude', 'land', 'rtl'}
 REQUIRED_FIELDS = {
     'takeoff': ('altitude',),
     'goto': ('x', 'y', 'z'),
     'hold': ('duration',),
+    'velocity': ('vx', 'vy', 'vz', 'duration'),
+    'attitude': ('roll', 'pitch', 'yaw', 'thrust', 'duration'),
     'land': (),
     'rtl': (),
 }
